@@ -60,6 +60,25 @@
 > | `0.23.0-emma` | `0.23.0` + cherry-pick | Tagged release based on upstream 0.23.0 (legacy) |
 > | `master` | upstream mirror | Do not commit directly, sync from upstream only |
 >
+> ## Current deployment
+>
+> The image is built manually from the Dockerfile in this repo and pushed to ECR:
+>
+> ```
+> Registry: 891377062002.dkr.ecr.eu-central-1.amazonaws.com
+> Image:    holmesgpt:0.23.0-alpha-emma
+> Arch:     amd64
+> ```
+>
+> **DEV, STG, and PROD all currently run `0.23.0-alpha-emma`.**
+>
+> ```bash
+> # Build and push (from repo root)
+> aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 891377062002.dkr.ecr.eu-central-1.amazonaws.com
+> docker build --platform linux/amd64 -t 891377062002.dkr.ecr.eu-central-1.amazonaws.com/holmesgpt:0.23.0-alpha-emma .
+> docker push 891377062002.dkr.ecr.eu-central-1.amazonaws.com/holmesgpt:0.23.0-alpha-emma
+> ```
+>
 > ## Updating to a new upstream version
 >
 > ```bash
