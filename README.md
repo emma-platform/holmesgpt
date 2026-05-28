@@ -74,7 +74,7 @@
 >
 > ```bash
 > # Build and push (from repo root)
-> aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 891377062002.dkr.ecr.eu-central-1.amazonaws.com
+> aws ecr get-login-password --region eu-central-1 --profile emma-infra | docker login --username AWS --password-stdin 891377062002.dkr.ecr.eu-central-1.amazonaws.com
 > docker build --platform linux/amd64 -t 891377062002.dkr.ecr.eu-central-1.amazonaws.com/holmesgpt:0.23.0-alpha-emma .
 > docker push 891377062002.dkr.ecr.eu-central-1.amazonaws.com/holmesgpt:0.23.0-alpha-emma
 > ```
