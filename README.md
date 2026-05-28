@@ -8,6 +8,70 @@
   </p>
 </div>
 
+> **This is an Emma internal fork of [robusta-dev/holmesgpt](https://github.com/robusta-dev/holmesgpt).**
+>
+> ## Why this fork exists
+>
+> We use HolmesGPT with an OpenAI-compatible endpoint that does not support `system` role
+> messages in the middle of a conversation (only as the first message).
+>
+> ### The problem
+>
+> LLM chat APIs use three message roles:
+>
+> - `system` — instructions for the model ("you are a helpful assistant...")
+> - `user` — message from the human
+> - `assistant` — model's response
+>
+> When a conversation grows too long, HolmesGPT compacts (summarizes) the history to free
+> up context window space. After compaction, the conversation looks like this:
+>
+> ```
+> [system]    "You are Holmes, you help diagnose issues..."   <- system prompt
+> [user]      "Why is pod X crashing?"                        <- last user question
+> [assistant] "Previously we discussed... we found that..."   <- compacted history
+> [system]    "The conversation history has been compacted. Continue."  <- THIS IS THE PROBLEM
+> ```
+>
+> The last message uses `system` role. Per the OpenAI spec, `system` can appear anywhere
+> in the conversation. However, many OpenAI-**compatible** APIs (vLLM, LiteLLM proxies,
+> custom endpoints) **only accept `system` as the first message** and reject it or behave
+> unpredictably when it appears mid-conversation.
+>
+> ### The fix
+>
+> The fix changes the continuation marker role from `system` to `user`. This message is
+> just a trivial instruction ("continue"), not a system-level directive — the model treats
+> it the same regardless of the role tag. The difference is purely technical: which role
+> tag a given API accepts. It also adds filtering in `find_last_user_prompt()` so the
+> marker is not mistakenly returned as the user's original question during re-compaction.
+>
+> ## Upstream PR
+>
+> This fix is tracked in upstream: [robusta-dev/holmesgpt#1871](https://github.com/robusta-dev/holmesgpt/pull/1871).
+> **This fork will be deprecated once the PR is merged and included in a release.**
+>
+> ## Branch and tag structure
+>
+> | Branch / Tag | Base | Description |
+> |---|---|---|
+> | `emma` | `0.31.1` + cherry-pick | Main working branch, use for builds |
+> | `0.31.1-emma` | `0.31.1` + cherry-pick | Tagged release based on upstream 0.31.1 |
+> | `0.23.0-emma` | `0.23.0` + cherry-pick | Tagged release based on upstream 0.23.0 (legacy) |
+> | `master` | upstream mirror | Do not commit directly, sync from upstream only |
+>
+> ## Updating to a new upstream version
+>
+> ```bash
+> git fetch upstream --tags
+> git checkout -b emma-update <new-tag>
+> git cherry-pick <emma-patch-commits>
+> # resolve conflicts if any, test, then:
+> git checkout emma && git merge emma-update
+> git tag <new-tag>-emma
+> git push origin emma --tags
+> ```
+
 Open-source AI agent for investigating production incidents and finding root causes. Works with any stack — Kubernetes, VMs, cloud providers, databases, and SaaS platforms. We are a [Cloud Native Computing Foundation](https://www.cncf.io/) sandbox project. Originally created by [Robusta.Dev](http://robusta.dev), with major contributions from [Microsoft](https://microsoft.com/).
 
 ## New: Operator Mode — Find Problems 24/7 in the Background
