@@ -879,7 +879,9 @@ class TestExceptionGroupUnwrapping:
             "unhandled errors in a TaskGroup (1 sub-exception)", [auth_error]
         )
 
-        async def mock_invoke_async(params, request_context):
+        async def mock_invoke_async(
+            params, request_context, user_approved=False, session_approved_prefixes=None
+        ):
             raise group
 
         monkeypatch.setattr(mcp_tool, "_invoke_async", mock_invoke_async)
@@ -925,6 +927,369 @@ class TestStreamableHttp:
             "holmes.plugins.toolsets.mcp.toolset_mcp.ClientSession",
             return_value=mock_session_context,
         )
+
+    def _enabled_mcp_toolset(self, monkeypatch, name, url, tools):
+        from holmes.core.tools import ToolsetStatusEnum
+
+        ts = RemoteMCPToolset(
+            name=name,
+            description=name,
+            config={"url": url, "mode": "streamable-http"},
+        )
+
+        async def _get_tools():
+            return ListToolsResult(tools=tools)
+
+        monkeypatch.setattr(ts, "_get_server_tools", _get_tools)
+        ts.prerequisites_callable(config=ts.config)
+        ts.status = ToolsetStatusEnum.ENABLED
+        return ts
+
+    def test_colliding_mcp_tools_prefixed_and_resolve_to_correct_server(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+
+        mcp_tool = Tool(
+            name="call_az",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+            description="run az",
+        )
+        ts_main = self._enabled_mcp_toolset(
+            monkeypatch, "azure_main", "http://main:8000/mcp", [mcp_tool]
+        )
+        ts_new = self._enabled_mcp_toolset(
+            monkeypatch, "azure_newaccount", "http://new:8001/mcp", [mcp_tool]
+        )
+
+        ex = ToolExecutor([ts_main, ts_new])
+
+        # The colliding tool is namespaced per server; the raw name is gone.
+        assert ex.tools_by_name.keys() >= {
+            "azure_main__call_az",
+            "azure_newaccount__call_az",
+        }
+        assert "call_az" not in ex.tools_by_name
+        assert ex._tool_to_toolset["azure_main__call_az"].name == "azure_main"
+        assert (
+            ex._tool_to_toolset["azure_newaccount__call_az"].name == "azure_newaccount"
+        )
+
+        # The toolset's own tool instances keep the raw name (not mutated).
+        assert [t.name for t in ts_main.tools] == ["call_az"]
+        assert [t.name for t in ts_new.tools] == ["call_az"]
+
+        # Invoking the prefixed tool routes to its own server with the RAW name.
+        tool = ex.tools_by_name["azure_newaccount__call_az"]
+        assert tool.mcp_tool_name == "call_az"
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock(return_value=None)
+        mock_session.call_tool = AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text="ok")],
+                isError=False,
+            )
+        )
+        c_ctx, s_ctx = self._setup_mocks(mock_session)
+        c_patch, s_patch = self._patch_clients(c_ctx, s_ctx)
+        with c_patch, s_patch:
+            result = asyncio.run(tool._invoke_async({}, None))
+        assert result.status == StructuredToolResultStatus.SUCCESS
+        mock_session.call_tool.assert_awaited_once_with("call_az", {})
+
+    def test_remote_publish_uses_namespaced_name_on_collision(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        # Collided tools must publish the exposed name the worker resolves.
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+        from holmes.utils.holmes_sync_toolsets import build_remote_tools_meta
+
+        mcp_tool = Tool(
+            name="call_az",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+            description="run az",
+        )
+        ts_main = self._enabled_mcp_toolset(
+            monkeypatch, "azure_main", "http://main:8000/mcp", [mcp_tool]
+        )
+        ts_new = self._enabled_mcp_toolset(
+            monkeypatch, "azure_newaccount", "http://new:8001/mcp", [mcp_tool]
+        )
+        ts_main.expose_remotely = True
+        ts_new.expose_remotely = True
+
+        ex = ToolExecutor([ts_main, ts_new])
+
+        meta = build_remote_tools_meta(ts_main, ex)
+        names = {t["function"]["name"] for t in meta["tools"]}
+        assert names == {"azure_main__call_az"}
+        # The published name is exactly what the remote worker resolves.
+        assert "azure_main__call_az" in ex.tools_by_name
+
+    def test_remote_publish_keeps_raw_name_without_collision(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+        from holmes.utils.holmes_sync_toolsets import build_remote_tools_meta
+
+        mcp_tool = Tool(
+            name="call_az",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+            description="run az",
+        )
+        ts = self._enabled_mcp_toolset(
+            monkeypatch, "azure_main", "http://main:8000/mcp", [mcp_tool]
+        )
+        ts.expose_remotely = True
+
+        ex = ToolExecutor([ts])
+
+        meta = build_remote_tools_meta(ts, ex)
+        names = {t["function"]["name"] for t in meta["tools"]}
+        assert names == {"call_az"}
+        assert "call_az" in ex.tools_by_name
+
+    def test_remote_publish_excludes_approval_tool_on_collision(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        # Approval filter must match the raw name, not the namespaced one.
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+        from holmes.utils.holmes_sync_toolsets import build_remote_tools_meta
+
+        gated = Tool(
+            name="run_kubectl_command",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+            description="mutating catch-all",
+        )
+        ts_a = self._enabled_mcp_toolset(
+            monkeypatch, "remediation_a", "http://a:8000/mcp", [gated]
+        )
+        ts_b = self._enabled_mcp_toolset(
+            monkeypatch, "remediation_b", "http://b:8001/mcp", [gated]
+        )
+        for ts in (ts_a, ts_b):
+            ts.expose_remotely = True
+            ts.approval_required_tools = ["run_kubectl_command"]
+
+        ex = ToolExecutor([ts_a, ts_b])
+
+        # Only tool is approval-gated -> excluded -> nothing to publish.
+        assert build_remote_tools_meta(ts_a, ex) is None
+
+    def test_collision_preserves_approval_gate_and_warns(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+
+        gated = Tool(
+            name="run_kubectl_command",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+            description="mutating catch-all",
+        )
+        ts_a = self._enabled_mcp_toolset(
+            monkeypatch, "remediation_a", "http://a:8000/mcp", [gated]
+        )
+        ts_b = self._enabled_mcp_toolset(
+            monkeypatch, "remediation_b", "http://b:8001/mcp", [gated]
+        )
+        ts_a.approval_required_tools = ["run_kubectl_command"]
+        ts_b.approval_required_tools = ["run_kubectl_command"]
+
+        # Spy on the emitting logger method directly — capturing dispatched log
+        # records (even with a handler attached to this exact logger) is flaky
+        # when other tests in the session reconfigure logging state.
+        with patch(
+            "holmes.core.tools_utils.tool_executor.display_logger.warning"
+        ) as warn:
+            ex = ToolExecutor([ts_a, ts_b])
+
+        # Collision → name namespaced, warning logged.
+        assert "run_kubectl_command" not in ex.tools_by_name
+        warned = [c.args[0] % tuple(c.args[1:]) for c in warn.call_args_list]
+        assert any("Multiple tools named 'run_kubectl_command'" in m for m in warned)
+
+        # Approval still fires, matched on the real name.
+        tool = ex.tools_by_name["remediation_a__run_kubectl_command"]
+        assert tool.mcp_tool_name == "run_kubectl_command"
+        approval = tool._check_approval_config()
+        assert approval is not None and approval.needs_approval
+
+    def test_single_mcp_instance_keeps_raw_tool_name(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+
+        mcp_tool = Tool(
+            name="call_az",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+            description="run az",
+        )
+        ts = self._enabled_mcp_toolset(
+            monkeypatch, "azure", "http://a:8000/mcp", [mcp_tool]
+        )
+        ex = ToolExecutor([ts])
+        # No collision → name unchanged from the raw server name.
+        assert "call_az" in ex.tools_by_name
+        assert ex.tools_by_name["call_az"].name == "call_az"
+
+    def test_resolve_tool_name_collisions_only_prefixes_collisions(
+        self, suppress_migration_warnings
+    ):
+        from holmes.core.tools_utils.tool_executor import resolve_tool_name_collisions
+
+        def mk(name):
+            return Tool(
+                name=name,
+                inputSchema={"type": "object", "properties": {}, "required": []},
+                description="d",
+            )
+
+        ts1 = RemoteMCPToolset(
+            name="azure_main",
+            description="d",
+            config={"url": "http://a/mcp", "mode": "streamable-http"},
+        )
+        ts2 = RemoteMCPToolset(
+            name="azure_newaccount",
+            description="d",
+            config={"url": "http://b/mcp", "mode": "streamable-http"},
+        )
+        ts1.tools = [
+            RemoteMCPTool.create(mk("call_az"), ts1),
+            RemoteMCPTool.create(mk("only_here"), ts1),
+        ]
+        ts2.tools = [RemoteMCPTool.create(mk("call_az"), ts2)]
+
+        resolved = {
+            (ts.name, tool.mcp_tool_name): name
+            for ts, tool, name in resolve_tool_name_collisions([ts1, ts2])
+        }
+        assert resolved[("azure_main", "call_az")] == "azure_main__call_az"
+        assert resolved[("azure_newaccount", "call_az")] == "azure_newaccount__call_az"
+        assert (
+            resolved[("azure_main", "only_here")] == "only_here"
+        )  # no collision → raw
+
+    def test_collision_prefix_is_sanitized(self, suppress_migration_warnings):
+        # Toolset names with spaces/dashes/dots must yield valid LLM function names.
+        from holmes.core.tools_utils.tool_executor import resolve_tool_name_collisions
+
+        def mk(name):
+            return Tool(
+                name=name,
+                inputSchema={"type": "object", "properties": {}, "required": []},
+                description="d",
+            )
+
+        ts1 = RemoteMCPToolset(
+            name="azure prod.1",
+            description="d",
+            config={"url": "http://a/mcp", "mode": "streamable-http"},
+        )
+        ts2 = RemoteMCPToolset(
+            name="azure-prod 2",
+            description="d",
+            config={"url": "http://b/mcp", "mode": "streamable-http"},
+        )
+        ts1.tools = [RemoteMCPTool.create(mk("call_az"), ts1)]
+        ts2.tools = [RemoteMCPTool.create(mk("call_az"), ts2)]
+
+        names = {n for _, _, n in resolve_tool_name_collisions([ts1, ts2])}
+        assert names == {"azure_prod_1__call_az", "azure_prod_2__call_az"}
+
+    def test_oauth_connect_placeholders_do_not_collide_across_servers(
+        self, suppress_migration_warnings
+    ):
+        # Two OAuth MCP servers each expose a `<toolset>_connect` placeholder;
+        # those names are per-server unique, so there is no collision to resolve.
+        from holmes.core.tools import ToolsetStatusEnum
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+
+        def connect_placeholder(ts):
+            t = Tool(
+                name=ts.connect_tool_name,
+                inputSchema={"type": "object", "properties": {}},
+                description="connect",
+            )
+            return RemoteMCPTool.create(t, ts)
+
+        ts1 = RemoteMCPToolset(
+            name="azure_main",
+            description="d",
+            config={"url": "http://a/mcp", "mode": "streamable-http"},
+        )
+        ts2 = RemoteMCPToolset(
+            name="azure_newaccount",
+            description="d",
+            config={"url": "http://b/mcp", "mode": "streamable-http"},
+        )
+        ts1.tools = [connect_placeholder(ts1)]
+        ts2.tools = [connect_placeholder(ts2)]
+        ts1.status = ts2.status = ToolsetStatusEnum.ENABLED
+
+        ex = ToolExecutor([ts1, ts2])
+        assert "azure_main_connect" in ex.tools_by_name
+        assert "azure_newaccount_connect" in ex.tools_by_name
+        # No collision → nothing was namespaced with the `__` prefix.
+        assert not any("__" in name for name in ex.tools_by_name)
+
+    def test_mixed_only_collisions_are_renamed_and_all_resolve(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        """Two servers share `shared` (collides) and each has a unique tool.
+        Proves: non-colliding tools are untouched; colliding ones are namespaced;
+        every tool resolves to the right server and invokes with its RAW name."""
+        from holmes.core.tools_utils.tool_executor import ToolExecutor
+
+        def mk(name):
+            return Tool(
+                name=name,
+                inputSchema={"type": "object", "properties": {}, "required": []},
+                description=name,
+            )
+
+        ts_a = self._enabled_mcp_toolset(
+            monkeypatch, "svc_a", "http://a:8000/mcp", [mk("shared"), mk("only_a")]
+        )
+        ts_b = self._enabled_mcp_toolset(
+            monkeypatch, "svc_b", "http://b:8001/mcp", [mk("shared"), mk("only_b")]
+        )
+        ex = ToolExecutor([ts_a, ts_b])
+        keys = set(ex.tools_by_name)
+
+        # NO-collision tools: names unchanged (raw), never prefixed.
+        assert {"only_a", "only_b"} <= keys
+        assert ex.tools_by_name["only_a"].name == "only_a"
+        assert ex.tools_by_name["only_b"].name == "only_b"
+        assert not any(k.endswith("__only_a") or k.endswith("__only_b") for k in keys)
+
+        # COLLISION tool: raw name gone, namespaced per server, each to right server.
+        assert "shared" not in keys
+        assert {"svc_a__shared", "svc_b__shared"} <= keys
+        assert ex._tool_to_toolset["svc_a__shared"].name == "svc_a"
+        assert ex._tool_to_toolset["svc_b__shared"].name == "svc_b"
+
+        # Every tool (colliding or not) invokes its server with the RAW name.
+        for key, expected_raw in (
+            ("only_a", "only_a"),
+            ("svc_a__shared", "shared"),
+            ("svc_b__shared", "shared"),
+        ):
+            t = ex.tools_by_name[key]
+            mock_session = AsyncMock()
+            mock_session.initialize = AsyncMock(return_value=None)
+            mock_session.call_tool = AsyncMock(
+                return_value=CallToolResult(
+                    content=[TextContent(type="text", text="ok")],
+                    isError=False,
+                )
+            )
+            c_ctx, s_ctx = self._setup_mocks(mock_session)
+            c_patch, s_patch = self._patch_clients(c_ctx, s_ctx)
+            with c_patch, s_patch:
+                res = asyncio.run(t._invoke_async({}, None))
+            assert res.status == StructuredToolResultStatus.SUCCESS
+            mock_session.call_tool.assert_awaited_once_with(expected_raw, {})
 
     @pytest.mark.parametrize(
         "tool_name,tool_schema,params,response_text,expected_in_response",
@@ -2574,3 +2939,360 @@ class TestJenkinsMCPConfig:
 
         assert ok is False
         assert msg  # error message must be non-empty
+
+
+class TestMCPHealthCheckTool:
+    """Tests for the health_check_tool feature that validates authentication."""
+
+    def test_health_check_tool_success(self, monkeypatch, suppress_migration_warnings):
+        """When health_check_tool succeeds, prerequisites pass."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000", "health_check_tool": "get_me"},
+        )
+
+        # Mock _get_server_tools to return a tool list including get_me
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="get_me",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                    Tool(
+                        name="list_repos",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="List repositories",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        # Mock _call_health_check_tool_async to return success
+        async def mock_call_health_check(tool_name):
+            return CallToolResult(content=[TextContent(type="text", text='{"login": "user"}')])
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, msg = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is True
+        assert msg == ""
+
+    def test_health_check_tool_auth_failure(self, monkeypatch, suppress_migration_warnings):
+        """When health_check_tool returns an error, prerequisites fail with clear message."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000", "health_check_tool": "get_me"},
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="get_me",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        # Mock _call_health_check_tool_async to return an error (bad token)
+        async def mock_call_health_check(tool_name):
+            return CallToolResult(
+                isError=True,
+                content=[TextContent(type="text", text="401 Unauthorized: Bad credentials")],
+            )
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, msg = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is False
+        assert "health check tool 'get_me'" in msg
+        assert "401 Unauthorized" in msg
+
+    def test_health_check_tool_not_found(self, monkeypatch, suppress_migration_warnings):
+        """When health_check_tool specifies a non-existent tool, prerequisites fail."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000", "health_check_tool": "nonexistent_tool"},
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="get_me",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        ok, msg = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is False
+        assert "not found" in msg
+        assert "nonexistent_tool" in msg
+        assert "get_me" in msg  # should list available tools
+
+    def test_health_check_tool_exception(self, monkeypatch, suppress_migration_warnings):
+        """When health_check_tool throws an exception, prerequisites fail with clear message."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000", "health_check_tool": "get_me"},
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="get_me",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        # Mock _call_health_check_tool_async to raise an exception
+        async def mock_call_health_check(tool_name):
+            raise ConnectionRefusedError("Connection refused")
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, msg = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is False
+        assert "health check tool 'get_me'" in msg
+        assert "Connection refused" in msg
+
+    def test_no_health_check_tool_skips_check(self, monkeypatch, suppress_migration_warnings):
+        """When health_check_tool is not set and the server exposes no known
+        identity tool, no additional check is performed."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000"},  # no health_check_tool
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="list_repos",  # not in the auto-detect allowlist
+                        inputSchema={"type": "object", "properties": {}},
+                        description="List repositories",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        # Should not call _call_health_check_tool_async at all
+        call_count = {"count": 0}
+
+        async def mock_call_health_check(tool_name):
+            call_count["count"] += 1
+            return CallToolResult(content=[])
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, _ = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is True
+        assert call_count["count"] == 0  # health check should not be called
+
+    def test_auto_detect_returns_none_when_no_identity_tool(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        """When the server exposes no allowlisted identity tool, auto-detection
+        returns None so the auth health check is skipped (and logged at debug)."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000"},  # no health_check_tool
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="list_repos",  # no allowlisted identity tool present
+                        inputSchema={"type": "object", "properties": {}},
+                        description="List repositories",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        ok, _ = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is True
+        # The skip is driven by auto-detect returning None — assert that directly
+        # rather than relying on caplog (root-logger capture is not deterministic
+        # under the parallel suite / varying global logging state).
+        assert toolset._auto_detect_health_check_tool() is None
+
+    def test_auto_detect_health_check_tool_catches_bad_auth(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        """When health_check_tool is not configured but the server exposes a
+        known identity tool (e.g. get_me), it is auto-detected and invoked, so a
+        bad token causes prerequisites to fail instead of appearing healthy."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000"},  # no health_check_tool
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="list_repos",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="List repositories",
+                    ),
+                    Tool(
+                        name="get_me",  # in the auto-detect allowlist
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        called_with = {}
+
+        async def mock_call_health_check(tool_name):
+            called_with["tool_name"] = tool_name
+            return CallToolResult(
+                isError=True,
+                content=[TextContent(type="text", text="401 Unauthorized: Bad credentials")],
+            )
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, msg = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is False
+        assert called_with["tool_name"] == "get_me"
+        assert "health check tool 'get_me'" in msg
+        assert "401 Unauthorized" in msg
+
+    def test_auto_detect_health_check_tool_success(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        """Auto-detected identity tool that succeeds leaves prerequisites passing."""
+        toolset = RemoteMCPToolset(
+            name="gitlab",
+            description="GitLab MCP",
+            config={"url": "http://localhost:8000"},  # no health_check_tool
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="get_current_user",  # GitLab-style identity tool
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        called_with = {}
+
+        async def mock_call_health_check(tool_name):
+            called_with["tool_name"] = tool_name
+            return CallToolResult(content=[TextContent(type="text", text='{"username": "user"}')])
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, msg = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is True
+        assert called_with["tool_name"] == "get_current_user"
+
+    def test_configured_health_check_tool_overrides_auto_detect(
+        self, monkeypatch, suppress_migration_warnings
+    ):
+        """An explicit health_check_tool takes precedence over auto-detection."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={"url": "http://localhost:8000", "health_check_tool": "get_me"},
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="get_me",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                    Tool(
+                        name="get_current_user",  # also in allowlist, must be ignored
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user (alt)",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        called_with = {}
+
+        async def mock_call_health_check(tool_name):
+            called_with["tool_name"] = tool_name
+            return CallToolResult(content=[TextContent(type="text", text='{"login": "user"}')])
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, _ = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is True
+        assert called_with["tool_name"] == "get_me"
+
+    def test_health_check_tool_in_stdio_mode(self, monkeypatch, suppress_migration_warnings):
+        """Health check tool also works in stdio mode."""
+        toolset = RemoteMCPToolset(
+            name="github",
+            description="GitHub MCP",
+            config={
+                "mode": "stdio",
+                "command": "github-mcp-server",
+                "args": ["stdio"],
+                "health_check_tool": "get_me",
+            },
+        )
+
+        async def mock_get_server_tools():
+            return ListToolsResult(
+                tools=[
+                    Tool(
+                        name="get_me",
+                        inputSchema={"type": "object", "properties": {}},
+                        description="Get current user",
+                    ),
+                ]
+            )
+
+        monkeypatch.setattr(toolset, "_get_server_tools", mock_get_server_tools)
+
+        async def mock_call_health_check(tool_name):
+            return CallToolResult(content=[TextContent(type="text", text='{"login": "user"}')])
+
+        monkeypatch.setattr(toolset, "_call_health_check_tool_async", mock_call_health_check)
+
+        ok, _ = toolset.prerequisites_callable(config=toolset.config)
+        assert ok is True

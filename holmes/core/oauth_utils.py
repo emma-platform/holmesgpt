@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
-from holmes.common.env_vars import DEFAULT_CLI_USER
 from mcp.client.auth.oauth2 import PKCEParameters
 from mcp.client.auth.utils import (
     build_oauth_authorization_server_metadata_discovery_urls,
@@ -76,8 +75,7 @@ def eager_load_oauth_tools(executor: Any) -> None:
         if not ts._mcp_config.oauth.authorization_url:
             continue
         for user_id in token_mgr.get_cached_user_ids(ts._mcp_config.oauth):
-            request_ctx = {"user_id": user_id} if user_id != DEFAULT_CLI_USER else None
-            executor.oauth_connector.load_tools_for_user(user_id, ts, request_ctx)
+            executor.oauth_connector.load_tools_for_user(user_id, ts, {"user_id": user_id})
 
 
 # exchange_code_for_tokens is re-exported from oauth_config (imported above)
@@ -196,8 +194,9 @@ def build_authorization_url(
     code_challenge: str,
     state: str,
     scopes: Optional[List[str]] = None,
+    resource: Optional[str] = None,
 ) -> str:
-    """Build the full authorization URL with PKCE and scope parameters."""
+    """Build the full authorization URL with PKCE, scope, and RFC 8707 resource parameters."""
     params = {
         "response_type": "code",
         "client_id": client_id,
@@ -208,6 +207,8 @@ def build_authorization_url(
     }
     if scopes:
         params["scope"] = " ".join(scopes)
+    if resource:
+        params["resource"] = resource
     return f"{authorization_url}?{urlencode(params)}"
 
 
@@ -255,6 +256,7 @@ def cli_oauth_flow(oauth: OAuthEndpoints, server_name: str) -> Optional[Dict[str
         state = secrets.token_urlsafe(32)
         auth_url = build_authorization_url(
             oauth.authorization_url, oauth.client_id, redirect_uri, code_challenge, state, oauth.scopes,
+            resource=oauth.resource,
         )
 
         logger.info("CLI OAuth %s: opening browser for authentication", server_name)
@@ -286,6 +288,7 @@ def cli_oauth_flow(oauth: OAuthEndpoints, server_name: str) -> Optional[Dict[str
             client_id=oauth.client_id,
             code_verifier=code_verifier,
             client_secret=oauth.client_secret,
+            resource=oauth.resource,
         )
     except OAuthTokenExchangeError as e:
         logger.warning("CLI OAuth %s: token exchange failed: %s", server_name, e)

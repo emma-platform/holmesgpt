@@ -118,6 +118,7 @@ class OAuthTokenManager:
                 client_id=token_data.get("client_id"),
                 authorization_url=provider_name,
                 user_id=user_id if user_id != DEFAULT_CLI_USER else None,
+                resource=token_data.get("resource"),
             )
             loaded += 1
 
@@ -135,27 +136,52 @@ class OAuthTokenManager:
     ) -> Optional[str]:
         """Return a valid access token, checking cache → refresh → persistent store.
 
+        A user_id must be present on request_context. CLI callers must pass
+        DEFAULT_CLI_USER explicitly; the server must pass the authenticated
+        user. Without a user_id the cache cannot be safely keyed, so we
+        refuse to serve any token (mirrors DalTokenStore.get_token's guard).
+
         Returns None if no token is available anywhere (caller should initiate OAuth flow).
         """
-        cache_key = self._get_cache_key(oauth_config, request_context)
         user_id = _get_user_id(request_context)
+        if not user_id:
+            return None
 
-        # 1. Check in-memory cache
+        cache_key = self._build_cache_key(user_id, oauth_config.authorization_url)
+        requested_resource = getattr(oauth_config, "resource", None)
+
+        # 1. Check in-memory cache. Serve a hit only if the token was issued for
+        #    the resource this toolset needs (RFC 8707 audience binding) — toolsets
+        #    sharing an IdP but targeting different MCP resources must not reuse it.
         cached = self._cache.get_valid_access_token(cache_key)
         if cached:
-            return cached
+            cached_resource = self._cache.get_resource(cache_key)
+            if self._resource_compatible(cached_resource, requested_resource):
+                return cached
+            logger.warning(
+                "OAuthTokenManager: cached token was issued for resource %r, not %r — refusing cross-resource reuse, attempting refresh",
+                cached_resource, requested_resource,
+            )
 
-        # 2. Try refresh
+        # 2. Try refresh (mints an audience-correct token when the cached one was
+        #    issued for a different resource)
         refreshed = self._refresh_token(cache_key, oauth_config, user_id=user_id)
         if refreshed:
             return refreshed
 
-        # 3. Check persistent store
+        # 3. Check persistent store — same audience check as the cache
         if not self._store:
             return None
         provider_name = oauth_config.authorization_url or (disk_key or "unknown")
         stored_token = self._store.get_token(provider_name, user_id=user_id, provider_aliases=provider_aliases)
         if stored_token and stored_token.get("access_token"):
+            stored_resource = stored_token.get("resource")
+            if not self._resource_compatible(stored_resource, requested_resource):
+                logger.warning(
+                    "OAuthTokenManager: stored token was issued for resource %r, not %r — refusing cross-resource reuse",
+                    stored_resource, requested_resource,
+                )
+                return None
             self._cache.set(
                 cache_key,
                 stored_token["access_token"],
@@ -166,11 +192,26 @@ class OAuthTokenManager:
                 client_id=stored_token.get("client_id", oauth_config.client_id),
                 authorization_url=oauth_config.authorization_url,
                 user_id=user_id,
+                resource=stored_token.get("resource", requested_resource),
             )
             logger.debug("OAuthTokenManager: loaded token from store (provider=%s)", oauth_config.authorization_url)
             return stored_token["access_token"]
 
         return None
+
+    @staticmethod
+    def _resource_compatible(token_resource: Optional[str], requested_resource: Optional[str]) -> bool:
+        """RFC 8707 audience check for serving a token.
+
+        A token may be served when either side doesn't specify a resource —
+        None (legacy entries / resource-less callers) and "" (explicit opt-out)
+        both mean unspecified — or when the resources match exactly. Two
+        different non-empty resources mean the token was issued for a different
+        MCP server and must not be reused.
+        """
+        if not token_resource or not requested_resource:
+            return True
+        return token_resource == requested_resource
 
     def has_token(
         self,
@@ -178,7 +219,10 @@ class OAuthTokenManager:
         request_context: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Check if any token (access or refreshable) is available in cache."""
-        cache_key = self._get_cache_key(oauth_config, request_context)
+        user_id = _get_user_id(request_context)
+        if not user_id:
+            return False
+        cache_key = self._build_cache_key(user_id, oauth_config.authorization_url)
         return self._cache.has_token_or_refresh(cache_key)
 
     def store_token(
@@ -190,14 +234,22 @@ class OAuthTokenManager:
         store_to_disk: bool = False,
     ) -> None:
         """Store a token to cache and persistent store."""
-        cache_key = self._get_cache_key(oauth_config, request_context)
         user_id = _get_user_id(request_context)
+        if not user_id:
+            logger.warning("OAuthTokenManager: refusing to store token without a user_id")
+            return
+
+        cache_key = self._build_cache_key(user_id, oauth_config.authorization_url)
         access_token = token_data.get("access_token")
         if not access_token:
             logger.warning("OAuthTokenManager: store_token called with no access_token")
             return
 
         expires_in = token_data.get("expires_in", 300)
+
+        # RFC 8707: prefer the effective resource recorded on the token during the
+        # exchange (e.g. a frontend override) over the configured default.
+        resource = token_data.get("resource", getattr(oauth_config, "resource", None))
 
         self._cache.set(
             cache_key,
@@ -209,6 +261,7 @@ class OAuthTokenManager:
             client_id=oauth_config.client_id,
             authorization_url=oauth_config.authorization_url,
             user_id=user_id,
+            resource=resource,
         )
 
         if self._store:
@@ -218,6 +271,7 @@ class OAuthTokenManager:
                 user_id=user_id,
                 token_url=oauth_config.token_url,
                 client_id=oauth_config.client_id,
+                resource=resource,
             )
 
         logger.debug(
@@ -226,17 +280,17 @@ class OAuthTokenManager:
         )
 
     def require_user_id(self, request_context: Optional[Dict[str, Any]]) -> str:
-        """Return a user_id, using DEFAULT_CLI_USER in CLI mode or raising in server mode.
+        """Return the user_id from request_context, or raise if absent.
 
-        CLI mode (DiskTokenStore / no store): returns DEFAULT_CLI_USER.
-        Server mode (DalTokenStore): raises ValueError if user_id is missing.
+        Callers (CLI, server, conversation worker) are responsible for putting
+        a real user_id on request_context — CLI uses DEFAULT_CLI_USER, server
+        uses the authenticated user. Missing user_id is a programming error
+        (would silently corrupt downstream per-user storage), so we fail fast.
         """
         user_id = _get_user_id(request_context)
-        if user_id:
-            return user_id
-        if isinstance(self._store, DalTokenStore):
-            return None
-        return DEFAULT_CLI_USER
+        if not user_id:
+            raise ValueError("OAuthTokenManager: user_id is required in request_context")
+        return user_id
 
     def shutdown(self) -> None:
         """Stop the background refresh thread."""
@@ -296,7 +350,7 @@ class OAuthTokenManager:
         """Refresh a single expiring token and push to persistent store."""
         refresh_token = entry.refresh_token
         if refresh_token and entry.token_url:
-            result = self._do_refresh_request(entry.token_url, entry.client_id, refresh_token, cache_key)
+            result = self._do_refresh_request(entry.token_url, entry.client_id, refresh_token, cache_key, resource=entry.resource)
             if result:
                 token_data, _access_token, _expires_in = result
                 if self._store:
@@ -306,6 +360,7 @@ class OAuthTokenManager:
                         user_id=entry.user_id,
                         token_url=entry.token_url,
                         client_id=entry.client_id,
+                        resource=entry.resource,
                     )
                 logger.info("OAuthTokenManager: sweep refreshed token (cache_key=%s)", cache_key)
                 return
@@ -326,6 +381,7 @@ class OAuthTokenManager:
                 client_id=entry.client_id,
                 authorization_url=entry.authorization_url,
                 user_id=entry.user_id,
+                resource=stored.get("resource", entry.resource),
             )
             logger.info("OAuthTokenManager: sweep reloaded token from store (cache_key=%s)", cache_key)
 
@@ -337,8 +393,25 @@ class OAuthTokenManager:
         if not refresh_token:
             return None
 
+        # RFC 8707: refresh for the resource the cached token was issued for
+        # (which may be a frontend override or an explicit "" opt-out). When the
+        # caller demands a *different* non-empty resource, request that instead —
+        # a token minted for the cached resource would be rejected by the
+        # caller's MCP server anyway (audience binding).
+        requested = getattr(oauth_config, "resource", None)
+        cached_resource = self._cache.get_resource(cache_key)
+        if requested and cached_resource and cached_resource != requested:
+            resource = requested
+        elif cached_resource is not None:
+            resource = cached_resource
+        else:
+            resource = requested
+
         try:
-            result = self._do_refresh_request(oauth_config.token_url, oauth_config.client_id, refresh_token, cache_key)
+            result = self._do_refresh_request(
+                oauth_config.token_url, oauth_config.client_id, refresh_token, cache_key,
+                resource=resource,
+            )
             if not result:
                 self._cache.evict(cache_key)
                 return None
@@ -351,6 +424,7 @@ class OAuthTokenManager:
                     user_id=user_id,
                     token_url=oauth_config.token_url,
                     client_id=oauth_config.client_id,
+                    resource=resource,
                 )
             return access_token
         except Exception:
@@ -360,19 +434,26 @@ class OAuthTokenManager:
 
     def _do_refresh_request(
         self, token_url: str, client_id: Optional[str], refresh_token: str, cache_key: str,
+        resource: Optional[str] = None,
     ) -> Optional[Tuple[Dict[str, Any], str, int]]:
         """POST to token endpoint, validate response, update cache.
+
+        ``resource`` is the RFC 8707 resource indicator; when set it is included
+        in the refresh request as required by the MCP authorization spec.
 
         Returns (token_data, access_token, expires_in) on success, None on failure.
         """
         logger.debug("OAuthTokenManager: refreshing token at %s (cache_key=%s)", token_url, cache_key)
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }
+        if resource:
+            data["resource"] = resource
         response = httpx.post(
             token_url,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-            },
+            data=data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=30,
         )
@@ -393,6 +474,7 @@ class OAuthTokenManager:
             expires_in=expires_in,
             refresh_token=token_data.get("refresh_token", refresh_token),
             refresh_expires_in=token_data.get("refresh_expires_in"),
+            resource=resource,
         )
         logger.debug("OAuthTokenManager: token refreshed (cache_key=%s, expires_in=%s)", cache_key, expires_in)
         return token_data, access_token, expires_in
@@ -400,7 +482,12 @@ class OAuthTokenManager:
     # ── Key helpers ────────────────────────────────────────────────────
 
     def _get_cache_key(self, oauth_config: Any, request_context: Optional[Dict[str, Any]]) -> str:
-        user_id = _get_user_id(request_context) or DEFAULT_CLI_USER
+        """Build a cache key from request_context. Raises if user_id is missing —
+        callers must put a user_id on the context (DEFAULT_CLI_USER in CLI mode,
+        authenticated user in server mode)."""
+        user_id = _get_user_id(request_context)
+        if not user_id:
+            raise ValueError("OAuthTokenManager: user_id is required in request_context")
         return self._build_cache_key(user_id, oauth_config.authorization_url)
 
     @staticmethod

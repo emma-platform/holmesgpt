@@ -48,6 +48,7 @@ from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
+from holmes.common.env_vars import DEFAULT_CLI_USER
 from holmes.config import Config
 from holmes.core.config import config_path_dir
 from holmes.core.init_event import StatusEvent, StatusEventKind, ToolsetStatus
@@ -66,7 +67,6 @@ from holmes.core.tool_calling_llm import (
     LLMResult,
     ToolCallingLLM,
     ToolCallResult,
-    extract_bash_session_prefixes,
 )
 from holmes.core.llm_usage import RequestStats
 from holmes.core.models import ToolApprovalDecision
@@ -2638,6 +2638,7 @@ def run_interactive_loop(
                                 cancel_event=_cancel_event,
                                 tool_number_offset=_tool_number_offset,
                                 iteration_offset=_iteration_offset,
+                                request_context={"user_id": DEFAULT_CLI_USER},
                             )
                             tool_decisions = None
                             last_event = None
